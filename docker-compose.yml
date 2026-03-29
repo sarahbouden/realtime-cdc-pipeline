@@ -1,0 +1,234 @@
+# =============================================================================
+# docker-compose.yml — Phase 2: Adding Kafka, ZooKeeper, Schema Registry,
+#                               and Debezium (Kafka Connect)
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # PostgreSQL — Source Database (unchanged from Phase 1)
+  # ---------------------------------------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    container_name: cdc_postgres
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/01_init.sql:ro
+    command:
+      - "postgres"
+      - "-c"
+      - "wal_level=logical"
+      - "-c"
+      - "max_replication_slots=4"
+      - "-c"
+      - "max_wal_senders=4"
+      - "-c"
+      - "log_replication_commands=on"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # ZooKeeper — Kafka Coordination Service
+  # Manages Kafka broker metadata, leader election, and cluster state.
+  # Must be healthy before Kafka starts.
+  # ---------------------------------------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    # We use Confluent's distribution — it's the most widely used in
+    # French enterprise environments and has the best Debezium compatibility.
+    container_name: cdc_zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      # The port ZooKeeper listens on for client connections (Kafka connects here)
+      ZOOKEEPER_TICK_TIME: 2000
+      # Basic time unit in milliseconds for ZooKeeper's internal heartbeats
+      ZOOKEEPER_LOG4J_ROOT_LOGLEVEL: WARN
+      # Reduce ZooKeeper's extremely verbose default logging
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/commands/ruok | grep ruok || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Kafka Broker — Event Streaming Backbone
+  # Receives CDC events from Debezium, stores them durably, serves them
+  # to downstream consumers (Flink in Phase 3).
+  # ---------------------------------------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: cdc_kafka
+    depends_on:
+      zookeeper:
+        condition: service_healthy
+    ports:
+      - "9092:9092"
+      # 9092 is exposed so you can connect from your host machine
+      # (e.g. with kafka-ui or kafkacat for debugging)
+    environment:
+      KAFKA_BROKER_ID: 1
+      # Unique ID for this broker — matters in multi-broker clusters
+
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      # Where to find ZooKeeper (container name resolves via Docker DNS)
+
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      # Two listeners: one for internal container-to-container traffic,
+      # one for external connections from your host machine
+
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      # PLAINTEXT://kafka:29092    — used by Debezium/Flink inside Docker network
+      # PLAINTEXT_HOST://localhost:9092 — used when connecting from your machine
+
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      # Replication factor 1 = no redundancy, acceptable for local dev.
+      # In production this would be 3 (one copy per broker).
+
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Skip rebalance delay on startup — speeds up local development
+
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Debezium will auto-create topics when it first publishes to them
+
+      KAFKA_LOG4J_ROOT_LOGLEVEL: WARN
+      # Reduce Kafka's verbose default logging
+
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Schema Registry — Centralized Schema Management
+  # Stores Avro/JSON schemas for Kafka messages.
+  # Debezium registers schemas here automatically when it starts publishing.
+  # ---------------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.6.0
+    container_name: cdc_schema_registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    ports:
+      - "8081:8081"
+      # REST API port — you can browse schemas at http://localhost:8081/subjects
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
+      # Connect to Kafka via the internal listener (not the host-facing one)
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: WARN
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8081/subjects || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 20s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Debezium (Kafka Connect) — CDC Connector
+  # Reads PostgreSQL's WAL and publishes change events to Kafka topics.
+  # This is the bridge between the operational DB and the streaming layer.
+  #
+  # Important: starting this container does NOT start capturing yet.
+  # We must register the connector configuration via Debezium's REST API
+  # after this container is healthy. The script in scripts/ does this.
+  # ---------------------------------------------------------------------------
+  debezium:
+    image: debezium/connect:2.6
+    container_name: cdc_debezium
+    depends_on:
+      kafka:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      schema-registry:
+        condition: service_healthy
+    ports:
+      - "8083:8083"
+      # Kafka Connect REST API — used to register, monitor, and manage connectors
+    environment:
+      BOOTSTRAP_SERVERS: kafka:29092
+      # Where Debezium sends captured events
+
+      GROUP_ID: debezium-connect-group
+      # Consumer group ID for this Kafka Connect cluster
+
+      CONFIG_STORAGE_TOPIC: debezium_configs
+      OFFSET_STORAGE_TOPIC: debezium_offsets
+      STATUS_STORAGE_TOPIC: debezium_statuses
+      # These three internal Kafka topics store Debezium's own state:
+      # - configs:  connector configurations
+      # - offsets:  last WAL position read per connector (enables resume after restart)
+      # - statuses: connector health and task status
+
+      CONFIG_STORAGE_REPLICATION_FACTOR: "1"
+      OFFSET_STORAGE_REPLICATION_FACTOR: "1"
+      STATUS_STORAGE_REPLICATION_FACTOR: "1"
+
+      KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+      KEY_CONVERTER_SCHEMAS_ENABLE: "false"
+      VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
+      # We use JSON (not Avro) for simplicity in Phase 2.
+      # In Phase 3 we can switch to Avro + Schema Registry for production-grade setup.
+
+      CONNECT_LOG4J_ROOT_LOGLEVEL: WARN
+
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 45s
+      # Longer start_period because Debezium waits for Kafka to be fully ready
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Simulator — Continuous Data Generator (unchanged from Phase 1)
+  # ---------------------------------------------------------------------------
+  simulator:
+    build:
+      context: ./simulator
+      dockerfile: Dockerfile
+    container_name: cdc_simulator
+    environment:
+      POSTGRES_HOST:     ${POSTGRES_HOST}
+      POSTGRES_PORT:     ${POSTGRES_PORT}
+      POSTGRES_DB:       ${POSTGRES_DB}
+      POSTGRES_USER:     ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SIMULATOR_ORDERS_PER_CYCLE: ${SIMULATOR_ORDERS_PER_CYCLE}
+      SIMULATOR_CYCLE_SECONDS:    ${SIMULATOR_CYCLE_SECONDS}
+      SIMULATOR_SEED_CUSTOMERS:   ${SIMULATOR_SEED_CUSTOMERS}
+      SIMULATOR_SEED_PRODUCTS:    ${SIMULATOR_SEED_PRODUCTS}
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+volumes:
+  postgres_data:
+    driver: local

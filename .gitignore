@@ -1,0 +1,29 @@
+# Environment variables — NEVER commit secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+
+# Docker volumes (if mounted locally)
+postgres-data/
+kafka-data/
+
+# IDE
+.vscode/settings.json
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# dbt (added in Phase 4)
+dbt/target/
+dbt/logs/
+
+warehouse/

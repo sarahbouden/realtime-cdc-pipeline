@@ -1,0 +1,43 @@
+[tool.poetry]
+name = "cdc-simulator"
+version = "0.1.0"
+description = "E-commerce order activity simulator for the CDC pipeline"
+authors = ["Sarra <sarra@example.com>"]
+readme = "README.md"
+# No packages to install — this is a script project, not a library
+
+[tool.poetry.dependencies]
+# Python version constraint — matches our Docker base image
+python = "^3.11"
+
+# PostgreSQL adapter — binary variant includes compiled C extensions,
+# no need for libpq-dev system library in the Docker image
+psycopg2-binary = "^2.9.9"
+
+# Realistic synthetic data generation (French locale supported)
+Faker = "^26.0.0"
+
+# Load .env files into os.environ automatically
+python-dotenv = "^1.0.1"
+
+[tool.poetry.group.dev.dependencies]
+# Development-only tools — NOT installed in the production Docker image
+# This is a key Poetry advantage: clean separation of dev vs prod deps
+
+# Code formatter — enforces consistent style
+black = "^24.0.0"
+
+# Linter — catches common bugs and style issues
+ruff = "^0.5.0"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
