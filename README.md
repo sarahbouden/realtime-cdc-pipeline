@@ -57,22 +57,6 @@ Terraform                       IaC for GCP cloud deployment
 
 ---
 
-## Key Design Decisions
-
-**Why Debezium over polling?**
-Debezium reads PostgreSQL's Write-Ahead Log (WAL) via logical replication — a mechanism that already exists for crash recovery. This means zero additional load on the source database, sub-second latency, and guaranteed capture of every change including DELETEs.
-
-**Why Flink over Spark Streaming?**
-Flink is a true streaming engine — it processes events one by one as they arrive. Spark Streaming uses micro-batches which introduces artificial latency. For CDC pipelines where every status change is a meaningful business event, true streaming is the correct choice.
-
-**Why DuckDB over BigQuery for local development?**
-DuckDB is an embedded OLAP engine that runs with zero infrastructure — no server, no port, no configuration. It reads Flink's output files directly via `read_json()`. The Terraform configuration defines the equivalent BigQuery setup for production deployment on GCP.
-
-**Why dbt for transformations?**
-dbt brings software engineering practices to SQL: version control, automated testing, dependency graphs, and documentation. Our `schema.yml` defines data quality tests (not_null, unique, accepted_values) that run automatically after every model build.
-
----
-
 ## Local Setup
 
 ### Prerequisites
