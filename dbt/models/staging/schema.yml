@@ -1,0 +1,60 @@
+# =============================================================================
+# schema.yml — Model documentation and data quality tests
+# Updated for dbt 1.11 syntax: accepted_values uses 'arguments' nesting
+# =============================================================================
+
+version: 2
+
+models:
+  - name: stg_orders
+    description: >
+      Cleaned and typed CDC events from the orders table.
+      One row per change event captured by Debezium.
+
+    columns:
+      - name: order_id
+        description: Unique identifier of the order
+        tests:
+          - not_null
+
+      - name: status
+        description: Order status at the time of the event
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['pending', 'confirmed', 'shipped', 'delivered', 'cancelled']
+
+      - name: operation_type
+        description: Database operation type (INSERT, UPDATE, DELETE)
+        tests:
+          - not_null
+          - accepted_values:
+              arguments:
+                values: ['INSERT', 'UPDATE', 'DELETE']
+
+      - name: unit_price
+        description: Price per unit at time of order
+        tests:
+          - not_null
+
+      - name: total_amount
+        description: Total order value
+        tests:
+          - not_null
+
+  - name: fct_orders
+    description: >
+      Deduplicated orders fact table. One row per order showing latest state.
+
+    columns:
+      - name: order_id
+        description: Unique order identifier
+        tests:
+          - unique
+          - not_null
+
+      - name: is_terminal_state
+        description: True if order is delivered or cancelled
+        tests:
+          - not_null

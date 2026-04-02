@@ -1,0 +1,18 @@
+# =============================================================================
+# profiles.yml — DuckDB connection configuration
+# =============================================================================
+
+ecommerce_pipeline:
+  target: dev
+  outputs:
+    dev:
+      type: duckdb
+      path: /warehouse/ecommerce.duckdb
+      schema: main
+      # Explicitly set schema to 'main' — DuckDB's default schema.
+      # Without this, dbt may look in a schema that doesn't exist yet,
+      # causing "table not found" errors even after a successful dbt run.
+      threads: 1
+      # Use 1 thread to avoid DuckDB write-lock conflicts.
+      # DuckDB allows only one writer at a time — multiple threads
+      # trying to write simultaneously causes locking errors.

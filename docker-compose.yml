@@ -1,12 +1,13 @@
 # =============================================================================
-# docker-compose.yml — Phase 2: Adding Kafka, ZooKeeper, Schema Registry,
-#                               and Debezium (Kafka Connect)
+# docker-compose.yml — Phase 3: Adding Apache Flink
+# Services: postgres, zookeeper, kafka, schema-registry, debezium,
+#           simulator, flink-jobmanager, flink-taskmanager
 # =============================================================================
 
 services:
 
   # ---------------------------------------------------------------------------
-  # PostgreSQL — Source Database (unchanged from Phase 1)
+  # PostgreSQL — Source Database
   # ---------------------------------------------------------------------------
   postgres:
     image: postgres:16-alpine
@@ -39,22 +40,15 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # ZooKeeper — Kafka Coordination Service
-  # Manages Kafka broker metadata, leader election, and cluster state.
-  # Must be healthy before Kafka starts.
+  # ZooKeeper — Kafka Coordination
   # ---------------------------------------------------------------------------
   zookeeper:
     image: confluentinc/cp-zookeeper:7.6.0
-    # We use Confluent's distribution — it's the most widely used in
-    # French enterprise environments and has the best Debezium compatibility.
     container_name: cdc_zookeeper
     environment:
       ZOOKEEPER_CLIENT_PORT: 2181
-      # The port ZooKeeper listens on for client connections (Kafka connects here)
       ZOOKEEPER_TICK_TIME: 2000
-      # Basic time unit in milliseconds for ZooKeeper's internal heartbeats
       ZOOKEEPER_LOG4J_ROOT_LOGLEVEL: WARN
-      # Reduce ZooKeeper's extremely verbose default logging
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost:8080/commands/ruok | grep ruok || exit 1"]
       interval: 10s
@@ -65,8 +59,6 @@ services:
 
   # ---------------------------------------------------------------------------
   # Kafka Broker — Event Streaming Backbone
-  # Receives CDC events from Debezium, stores them durably, serves them
-  # to downstream consumers (Flink in Phase 3).
   # ---------------------------------------------------------------------------
   kafka:
     image: confluentinc/cp-kafka:7.6.0
@@ -76,37 +68,16 @@ services:
         condition: service_healthy
     ports:
       - "9092:9092"
-      # 9092 is exposed so you can connect from your host machine
-      # (e.g. with kafka-ui or kafkacat for debugging)
     environment:
       KAFKA_BROKER_ID: 1
-      # Unique ID for this broker — matters in multi-broker clusters
-
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      # Where to find ZooKeeper (container name resolves via Docker DNS)
-
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
-      # Two listeners: one for internal container-to-container traffic,
-      # one for external connections from your host machine
-
       KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
-      # PLAINTEXT://kafka:29092    — used by Debezium/Flink inside Docker network
-      # PLAINTEXT_HOST://localhost:9092 — used when connecting from your machine
-
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
-      # Replication factor 1 = no redundancy, acceptable for local dev.
-      # In production this would be 3 (one copy per broker).
-
       KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
-      # Skip rebalance delay on startup — speeds up local development
-
       KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
-      # Debezium will auto-create topics when it first publishes to them
-
       KAFKA_LOG4J_ROOT_LOGLEVEL: WARN
-      # Reduce Kafka's verbose default logging
-
     healthcheck:
       test: ["CMD-SHELL", "kafka-broker-api-versions --bootstrap-server localhost:9092"]
       interval: 10s
@@ -117,8 +88,6 @@ services:
 
   # ---------------------------------------------------------------------------
   # Schema Registry — Centralized Schema Management
-  # Stores Avro/JSON schemas for Kafka messages.
-  # Debezium registers schemas here automatically when it starts publishing.
   # ---------------------------------------------------------------------------
   schema-registry:
     image: confluentinc/cp-schema-registry:7.6.0
@@ -128,11 +97,9 @@ services:
         condition: service_healthy
     ports:
       - "8081:8081"
-      # REST API port — you can browse schemas at http://localhost:8081/subjects
     environment:
       SCHEMA_REGISTRY_HOST_NAME: schema-registry
       SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: kafka:29092
-      # Connect to Kafka via the internal listener (not the host-facing one)
       SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
       SCHEMA_REGISTRY_LOG4J_ROOT_LOGLEVEL: WARN
     healthcheck:
@@ -144,13 +111,7 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Debezium (Kafka Connect) — CDC Connector
-  # Reads PostgreSQL's WAL and publishes change events to Kafka topics.
-  # This is the bridge between the operational DB and the streaming layer.
-  #
-  # Important: starting this container does NOT start capturing yet.
-  # We must register the connector configuration via Debezium's REST API
-  # after this container is healthy. The script in scripts/ does this.
+  # Debezium — CDC Connector (Kafka Connect)
   # ---------------------------------------------------------------------------
   debezium:
     image: debezium/connect:2.6
@@ -164,46 +125,117 @@ services:
         condition: service_healthy
     ports:
       - "8083:8083"
-      # Kafka Connect REST API — used to register, monitor, and manage connectors
     environment:
       BOOTSTRAP_SERVERS: kafka:29092
-      # Where Debezium sends captured events
-
       GROUP_ID: debezium-connect-group
-      # Consumer group ID for this Kafka Connect cluster
-
       CONFIG_STORAGE_TOPIC: debezium_configs
       OFFSET_STORAGE_TOPIC: debezium_offsets
       STATUS_STORAGE_TOPIC: debezium_statuses
-      # These three internal Kafka topics store Debezium's own state:
-      # - configs:  connector configurations
-      # - offsets:  last WAL position read per connector (enables resume after restart)
-      # - statuses: connector health and task status
-
       CONFIG_STORAGE_REPLICATION_FACTOR: "1"
       OFFSET_STORAGE_REPLICATION_FACTOR: "1"
       STATUS_STORAGE_REPLICATION_FACTOR: "1"
-
       KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
       KEY_CONVERTER_SCHEMAS_ENABLE: "false"
       VALUE_CONVERTER_SCHEMAS_ENABLE: "false"
-      # We use JSON (not Avro) for simplicity in Phase 2.
-      # In Phase 3 we can switch to Avro + Schema Registry for production-grade setup.
-
       CONNECT_LOG4J_ROOT_LOGLEVEL: WARN
-
     healthcheck:
       test: ["CMD-SHELL", "curl -f http://localhost:8083/connectors || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 15
       start_period: 45s
-      # Longer start_period because Debezium waits for Kafka to be fully ready
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # Simulator — Continuous Data Generator (unchanged from Phase 1)
+  # Flink JobManager — Cluster Coordinator
+  # Receives job submissions, plans execution, coordinates TaskManagers.
+  # ---------------------------------------------------------------------------
+  flink-jobmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: cdc_flink_jobmanager
+    # Fix warehouse permissions at container startup, then start jobmanager.
+    # The chmod is needed because Docker mounts the host volume AFTER the
+    # Dockerfile RUN commands execute — so build-time permissions are overridden
+    # by the mount. We reapply them here at runtime as root before switching user.
+    entrypoint: >
+      /bin/bash -c "
+        chmod -R 777 /warehouse &&
+        /docker-entrypoint.sh jobmanager
+      "
+    ports:
+      - "8082:8081"
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        rest.bind-port: 8081
+        state.backend: filesystem
+        state.checkpoints.dir: file:///warehouse/checkpoints
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      WAREHOUSE_PATH: /warehouse
+    volumes:
+      - ./warehouse:/warehouse
+    depends_on:
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8081/overview || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Flink TaskManager — Worker Node
+  # ---------------------------------------------------------------------------
+  flink-taskmanager:
+    build:
+      context: ./flink
+      dockerfile: Dockerfile
+    container_name: cdc_flink_taskmanager
+    entrypoint: >
+      /bin/bash -c "
+        chmod -R 777 /warehouse &&
+        /docker-entrypoint.sh taskmanager
+      "
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///warehouse/checkpoints
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      WAREHOUSE_PATH: /warehouse
+    volumes:
+      - ./warehouse:/warehouse
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    restart: unless-stopped
+
+
+  # ---------------------------------------------------------------------------
+  # dbt — Analytical Transformations on DuckDB
+  # Reads JSON files written by Flink, runs SQL models every 60 seconds,
+  # and materializes clean analytical tables in DuckDB.
+  # ---------------------------------------------------------------------------
+  dbt:
+    build:
+      context: ./dbt
+      dockerfile: Dockerfile
+    container_name: cdc_dbt
+    volumes:
+      - ./warehouse:/warehouse
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Simulator — Continuous Data Generator
   # ---------------------------------------------------------------------------
   simulator:
     build:
@@ -226,9 +258,98 @@ services:
     restart: unless-stopped
 
 
+  # ---------------------------------------------------------------------------
+  # Airflow — Pipeline Orchestration
+  # Schedules and monitors dbt runs every 5 minutes.
+  # Uses LocalExecutor (single-process) — sufficient for local dev.
+  # In production you'd use CeleryExecutor or KubernetesExecutor.
+  # ---------------------------------------------------------------------------
+  airflow:
+    build:
+      context: ./airflow
+      dockerfile: Dockerfile
+    container_name: cdc_airflow
+    environment:
+      AIRFLOW__CORE__EXECUTOR: SequentialExecutor
+      # SequentialExecutor is the only executor compatible with SQLite.
+      # LocalExecutor requires PostgreSQL — Airflow 2.9 changed the default
+      # to LocalExecutor which broke SQLite-based setups.
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: sqlite:////home/airflow/airflow.db
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      AIRFLOW__WEBSERVER__SECRET_KEY: "cdc-pipeline-local-dev"
+      AIRFLOW__CORE__DAGS_FOLDER: /dags
+    volumes:
+      - ./airflow/dags:/dags
+      - ./dbt:/dbt
+      - ./warehouse:/warehouse
+    ports:
+      - "8080:8080"
+    command:
+      - bash
+      - -c
+      - "exec airflow standalone" 
+    depends_on:
+      flink-jobmanager:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 90s
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # Grafana — Dashboards and Visualization
+  # Connects to DuckDB and renders live business KPI dashboards.
+  # ---------------------------------------------------------------------------
+  # ---------------------------------------------------------------------------
+  # API — Lightweight REST API exposing DuckDB metrics for Grafana
+  # Implements the SimpleJSON protocol so Grafana can query DuckDB directly.
+  # ---------------------------------------------------------------------------
+  api:
+    build:
+      context: ./api
+      dockerfile: Dockerfile
+    container_name: cdc_api
+    environment:
+      DUCKDB_PATH: /warehouse/ecommerce.duckdb
+      API_PORT: "3001"
+    volumes:
+      - ./warehouse:/warehouse
+    ports:
+      - "3001:3001"
+    depends_on:
+      - dbt
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: cdc_grafana
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: grafana-admin-2026
+      GF_INSTALL_PLUGINS: simpod-json-datasource
+      # simpod-json-datasource is a stable, widely-used Grafana plugin that
+      # queries any REST API following the SimpleJSON protocol.
+      # Our lightweight Python API (api/ service) implements this protocol.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning
+      - ./warehouse:/warehouse
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - dbt
+      - api
+    restart: unless-stopped
+
+
 # =============================================================================
 # VOLUMES
 # =============================================================================
 volumes:
   postgres_data:
+    driver: local
+  grafana_data:
     driver: local

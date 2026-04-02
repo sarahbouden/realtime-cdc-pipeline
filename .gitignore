@@ -27,3 +27,9 @@ dbt/target/
 dbt/logs/
 
 warehouse/
+
+# Claude Code internal files
+.claude/
+
+# Terraform secrets (example file is safe to commit, actual values are not)
+terraform.tfvars
