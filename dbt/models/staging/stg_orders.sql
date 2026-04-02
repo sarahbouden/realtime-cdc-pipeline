@@ -41,7 +41,11 @@ SELECT
     CAST(product_id  AS BIGINT)          AS product_id,
     CAST(quantity    AS INTEGER)         AS quantity,
     CAST(unit_price  AS DECIMAL(10, 2))  AS unit_price,
-    CAST(total_amount AS DECIMAL(10, 2)) AS total_amount,
+    -- total_amount is a PostgreSQL GENERATED column (quantity * unit_price).
+    -- Debezium never includes generated column values in CDC payloads — they
+    -- always arrive as null. We recompute it here from the two source fields,
+    -- which ARE captured correctly by Debezium.
+    CAST(quantity * unit_price AS DECIMAL(10, 2)) AS total_amount,
     LOWER(TRIM(status))                  AS status,
     UPPER(TRIM(operation))               AS operation_type,
     CAST(created_at  AS TIMESTAMP)       AS created_at,

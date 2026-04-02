@@ -229,6 +229,7 @@ services:
     container_name: cdc_dbt
     volumes:
       - ./warehouse:/warehouse
+      - ./dbt:/dbt  # live-mount source so model changes take effect without rebuilding the image
     depends_on:
       flink-jobmanager:
         condition: service_healthy
