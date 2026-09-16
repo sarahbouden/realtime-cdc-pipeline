@@ -140,5 +140,3 @@ This is infrastructure definition only. Migrating the streaming layer and adding
 ## Limits
 
 Single-node, single-parallelism, synthetic traffic from a local generator. No schema-evolution handling, no dead-letter path, no backfill strategy, no alerting. Credentials in `debezium/register-connector.json` are local development values committed on purpose; a real deployment would source them from a secret store.
-
-I would rather state this than have it found in an interview.
