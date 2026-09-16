@@ -1,135 +1,131 @@
-# Real-Time CDC Pipeline — E-Commerce Order Tracking
+# Real-Time CDC Pipeline
 
-> A production-grade real-time data pipeline built with Change Data Capture (CDC), demonstrating end-to-end data engineering skills across ingestion, streaming, transformation, warehousing, orchestration, and cloud infrastructure.
+Change data capture from a PostgreSQL write-ahead log into an analytical warehouse, with stream processing, a dbt transformation layer, orchestration, and dashboards. Runs locally on Docker Compose; the cloud target is provisioned with Terraform.
+
+**Status:** self-built portfolio project. It runs end to end on one machine at single parallelism. It has not been operated in production or under sustained load — see [Limits](#limits).
 
 ---
 
-## Business Case
+## The problem
 
-In e-commerce, the operational database (PostgreSQL) handles thousands of transactions per minute. The analytics team needs real-time visibility into order trends, revenue, and cancellation rates — but cannot query the production database directly (too risky, too slow).
+An operational Postgres database serves order traffic. Analysts need current order state, revenue and cancellation rates, but querying the operational database directly is unsafe under load and the queries are the wrong shape for it. Periodic batch extracts either miss updates or re-scan the whole table.
 
-This pipeline solves that by automatically capturing every database change (INSERT, UPDATE, DELETE) and streaming it into an analytical warehouse in near real-time, keeping operational and analytical layers permanently synchronized without any impact on the source system.
+CDC solves this by reading the database's own replication stream. Every INSERT, UPDATE and DELETE becomes an event, so the analytical copy stays current without the source database ever serving an analytical query.
 
 ---
 
 ## Architecture
 
+```mermaid
+flowchart TD
+    PG[(PostgreSQL 16<br/>logical replication / pgoutput)]
+    DBZ[Debezium 2.6<br/>ExtractNewRecordState unwrap]
+    K[Kafka 7.6<br/>ecommerce.public.*]
+    F[Flink 1.19<br/>Table API streaming job]
+    W[/warehouse/orders_processed<br/>rolling NDJSON, 60s/]
+    D[(DuckDB)]
+    DBT[dbt 1.11<br/>stg → marts]
+    AF[Airflow 2.9<br/>dbt run → dbt test, every 5 min]
+    API[Metrics API<br/>DuckDB → JSON]
+    G[Grafana 10.4<br/>4 panels]
+
+    PG -->|WAL| DBZ --> K --> F --> W --> D
+    DBT -.reads/writes.-> D
+    AF -->|triggers| DBT
+    D --> API --> G
 ```
-PostgreSQL (WAL)
-    │
-    ▼
-Debezium (CDC Connector)        captures row-level changes via logical replication
-    │
-    ▼
-Apache Kafka                    durable event streaming backbone
-    │
-    ▼
-Apache Flink                    real-time stream processing & transformation
-    │
-    ▼
-DuckDB + dbt                    analytical warehouse + SQL models + data quality
-    │
-    ▼
-Grafana                         live business dashboards
-    │
-Airflow                         orchestration & scheduling
-    │
-Terraform                       IaC for GCP cloud deployment
-```
+
+**Why these pieces.** Debezium reads the WAL rather than polling, so updates and deletes are captured, not just inserts. The `ExtractNewRecordState` transform unwraps Debezium's before/after envelope and adds `__op`, `__table` and `__ts_ms` as top-level fields, which is what lets the Flink schema stay flat. Flink filters out the initial snapshot reads (`__op = 'r'`) and maps operation codes to readable strings before writing rolling NDJSON files. DuckDB reads those files directly with a glob, so there is no loader process to maintain. dbt does the deduplication — `fct_orders` keeps the latest event per `order_id` by `processed_at` — which keeps the streaming layer stateless and the correctness logic in testable SQL.
 
 ---
 
-## Tech Stack
+## Stack
 
 | Layer | Technology | Version |
-|-------|-----------|---------|
-| Source DB | PostgreSQL | 16 |
-| CDC Capture | Debezium | 2.6 |
-| Event Streaming | Apache Kafka | 7.6 (Confluent) |
-| Stream Processing | Apache Flink | 1.19 |
+|---|---|---|
+| Source database | PostgreSQL | 16 |
+| CDC capture | Debezium | 2.6 |
+| Event streaming | Apache Kafka (Confluent) | 7.6 |
+| Stream processing | Apache Flink (PyFlink Table API) | 1.19 |
 | Warehouse | DuckDB | 1.x |
 | Transformation | dbt Core | 1.11 |
 | Orchestration | Apache Airflow | 2.9 |
 | Dashboards | Grafana | 10.4 |
-| IaC | Terraform | >= 1.5 |
-| Containerization | Docker Compose | v2 |
-| Language | Python | 3.11 |
+| Cloud IaC | Terraform | ≥ 1.5 |
+| Runtime | Docker Compose (12 services) | v2 |
 
 ---
 
-## Local Setup
+## What is actually built
 
-### Prerequisites
-- Docker Desktop 24+
-- Docker Compose v2
-- Git
+| Component | State |
+|---|---|
+| Debezium connector for `orders`, `customers`, `products` | Configured and registered |
+| Flink streaming job | Implemented. Consumes `ecommerce.public.orders` only |
+| dbt models | 3: `stg_orders`, `fct_orders`, `fct_order_metrics` |
+| dbt tests | 10 declared (`not_null`, `unique`, `accepted_values`) across `stg_orders` and `fct_orders` |
+| Airflow DAG | `dbt_ecommerce_pipeline` — `dbt_run >> dbt_test`, every 5 min, 2 retries with exponential backoff |
+| Grafana dashboard | 4 panels: orders by status, gross revenue by hour, order volume by hour, cancellation rate |
+| Terraform (GCP) | Cloud SQL, GCS data lake, BigQuery dataset + 2 tables, VPC/subnet/firewall, service account with scoped IAM |
+| Order simulator | Generates continuous order traffic to drive the pipeline |
 
-### Run the Pipeline
+**Known gaps, deliberately listed:**
+
+- `customers` and `products` are captured into Kafka but not consumed downstream. Only the `orders` topic is processed.
+- `fct_order_metrics` has no tests and no `schema.yml` entry.
+- Terraform provisions the cloud *targets*. It does not deploy Kafka, Debezium or Flink to GCP, and `dbt/profiles.yml` has only a DuckDB output — there is no BigQuery target yet. The cloud path is provisioned, not wired.
+- Flink runs at `parallelism = 1` with 30-second exactly-once checkpointing. Correct for a single-node demo; not a throughput claim.
+
+---
+
+## Run it
+
+**Prerequisites:** Docker Desktop 24+, Docker Compose v2.
 
 ```bash
-# 1. Clone the repository
 git clone https://github.com/sarahbouden/realtime-cdc-pipeline.git
 cd realtime-cdc-pipeline
 
-# 2. Create environment file
-cp .env.example .env
+cp .env.example .env          # defaults work as-is for local
+docker compose up --build     # 12 services
 
-# 3. Generate the Poetry lock file for the simulator
-#    (only needed once — poetry.lock is committed so this is usually skipped)
-cd simulator && poetry install && cd ..
-
-# 4. Start all services (10 containers)
-#    Docker builds the simulator image using Poetry internally
-docker compose up --build
-
-# 5. Register the Debezium CDC connector
-bash scripts/register-debezium.sh
-
-# 6. Submit the Flink streaming job
-bash scripts/submit-flink-job.sh
+bash scripts/register-debezium.sh    # register the CDC connector
+bash scripts/submit-flink-job.sh     # submit the streaming job
 ```
 
-> **Note:** No virtual environment setup needed. The simulator uses [Poetry](https://python-poetry.org/) for dependency management — Docker handles the Poetry install internally during image build. All other services run as pre-built Docker images.
-
-### Verify the Pipeline
+Verify events are flowing:
 
 ```bash
-# Check CDC events flowing through Kafka
 docker exec -it cdc_kafka kafka-console-consumer \
   --bootstrap-server localhost:9092 \
   --topic ecommerce.public.orders \
   --from-beginning --max-messages 5
+```
 
-# Query the analytical warehouse
+Query the warehouse:
+
+```bash
 docker exec -it cdc_dbt python3 -c "
 import duckdb
 con = duckdb.connect('/warehouse/ecommerce.duckdb')
-print(con.execute('SELECT status, COUNT(*) as orders, ROUND(SUM(total_amount),2) as revenue FROM fct_orders GROUP BY status ORDER BY orders DESC').df())
+print(con.execute('SELECT status, COUNT(*) AS orders, ROUND(SUM(total_amount),2) AS revenue FROM fct_orders GROUP BY status ORDER BY orders DESC').df())
 "
 ```
 
-### Service URLs
+| Service | URL |
+|---|---|
+| Flink Web UI | http://localhost:8082 |
+| Airflow | http://localhost:8080 |
+| Grafana | http://localhost:3000 (admin/admin) |
+| Kafka Connect | http://localhost:8083 |
+| Schema Registry | http://localhost:8081 |
+| Metrics API | http://localhost:3001 |
 
-| Service | URL | Credentials |
-|---------|-----|-------------|
-| Flink Web UI | http://localhost:8082 | — |
-| Airflow | http://localhost:8080 | admin / (see logs) |
-| Grafana | http://localhost:3000 | admin / admin |
-| Kafka Connect | http://localhost:8083 | — |
-| Schema Registry | http://localhost:8081 | — |
-| Metrics API | http://localhost:3001 | — |
+---
 
-## Cloud Deployment (Terraform / GCP)
+## Cloud target (Terraform)
 
-The `terraform/` directory contains production-ready IaC for GCP deployment:
-
-- **Cloud SQL** (PostgreSQL 16 with logical replication)
-- **GCS bucket** (data lake, replaces local warehouse/)
-- **BigQuery** (analytical warehouse, replaces DuckDB)
-- **VPC network** with private subnets and firewall rules
-- **Service account** with least-privilege IAM roles
-
-Target region: `europe-west9` (Paris) for GDPR compliance and low latency.
+`terraform/` provisions the GCP side: Cloud SQL Postgres 16 with logical replication, a GCS data lake bucket, a BigQuery dataset with `fct_orders` and `fct_order_metrics`, a VPC with private subnet and firewall rules, and a service account with scoped IAM bindings. Region `europe-west9`.
 
 ```bash
 cd terraform/
@@ -137,10 +133,12 @@ cp terraform.tfvars.example terraform.tfvars
 terraform init && terraform plan
 ```
 
+This is infrastructure definition only. Migrating the streaming layer and adding a BigQuery dbt target are the next steps, not done.
+
 ---
 
-## Author
+## Limits
 
-**Sarra** — Data Science & AI Engineering Student (Bac+5)  
-Mercedes-Benz Internship · Stuttgart/Sindelfingen, Germany  
-Targeting: Lead Data Engineer / Head of Data roles in France
+Single-node, single-parallelism, synthetic traffic from a local generator. No schema-evolution handling, no dead-letter path, no backfill strategy, no alerting. Credentials in `debezium/register-connector.json` are local development values committed on purpose; a real deployment would source them from a secret store.
+
+I would rather state this than have it found in an interview.
